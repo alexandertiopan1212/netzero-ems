@@ -1,0 +1,5 @@
+pandas==2.2.3
+plotly==6.0.1
+Requests==2.32.3
+streamlit==1.44.1
+streamlit_flow_component==1.6.1
