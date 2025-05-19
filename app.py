@@ -14,6 +14,16 @@ from streamlit_flow.state import StreamlitFlowState
 from streamlit_flow.layouts import TreeLayout
 
 # --- Constants ---
+REC_PRICE_IDR_PER_MWh = 1500000  # Harga REC Indonesia
+CARBON_PRICE_IDR_PER_KG = 160    # $10/ton @kurs 16,000
+GHG_INTENSITY = {                # Faktor emisi berbagai sumber
+    'grid': 0.82,
+    'diesel': 0.8,
+    'gas': 0.45,
+    'coal': 1.1
+}
+USD_IDR = 16000                 # Asumsi kurs USD-IDR
+
 EMISSION_FACTOR_KG_PER_KWH = 0.82  # Indonesia grid avg
 GRID_TARIFF_IDR_PER_KWH = 1500     # PLN Bisnis estimate
 INTERVAL = 60                      # Default polling interval in seconds
@@ -217,6 +227,28 @@ def generate_flow_elements(raw_data: dict) -> tuple[list[StreamlitFlowNode], lis
 
     return nodes, edges
 
+def calculate_emission_scopes(raw_data: dict, daily_buy: float) -> dict:
+    """Hitung emisi berdasarkan GHG Protocol dengan breakdown detail"""
+    return {
+        'scope1': {
+            'sources': ['Diesel Generator'],
+            'emission': raw_data.get('DieselConsumption', 0) * GHG_INTENSITY['diesel'],
+            'unit': 'kg'
+        },
+        'scope2': {
+            'grid_import': daily_buy * GHG_INTENSITY['grid'],
+            'unit': 'kg'
+        },
+        'scope3': {
+            'components': {
+                'BatteryProduction': raw_data.get('BatteryCapacity', 0) * 150,  # 150kg CO2/kWh
+                'PVProduction': raw_data.get('PVCapacity', 0) * 500,            # 500kg CO2/kWp
+                'Commuting': raw_data.get('EmployeeCount', 0) * 365 * 0.5       # Asumsi 0.5kg/hr
+            },
+            'unit': 'kg'
+        }
+    }
+
 # --- Main Application ---
 def main() -> None:
     """Run the Satu.Energy Elite Dashboard."""
@@ -241,6 +273,7 @@ def main() -> None:
     if not raw_data:
         st.sidebar.info("Waiting for data…")
         st.stop()
+    raw = raw_data
 
     last_update = pd.to_datetime(latest_ts)
     now = datetime.utcnow()
@@ -326,85 +359,238 @@ def main() -> None:
                    .update_layout(height=330, template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)"))
             st.plotly_chart(fig, use_container_width=True, key="trend")
 
-    # Insights Tab
+    # ───────── Insights Tab ───────────────────────────────────────────
     with tab_ins:
-        st.markdown("<div class='glass-card'><h3>Actionable Insights</h3></div>", unsafe_allow_html=True)
-        daily_prod = float(raw_data.get("DailyActiveProduction", {"value": 0})["value"])
-        daily_cons = float(raw_data.get("DailyConsumption", {"value": 0})["value"])
-        daily_buy = float(raw_data.get("DailyEnergyBuy", {"value": 0})["value"])
-        daily_sell = float(raw_data.get("DailyEnergySell", {"value": 0})["value"])
-        net_energy = daily_prod - daily_cons
-        soc = float(raw_data.get("SOC", {"value": 0})["value"])
+        st.markdown(
+            """
+            <div class='glass-card' style="background:linear-gradient(135deg,rgba(0,204,0,.15),rgba(0,0,0,.3));">
+                <h2 style="border-bottom:2px solid var(--pv);padding-bottom:.5rem;">♻️ Sustainability Intelligence Suite</h2>
+            </div>
+            """, unsafe_allow_html=True)
 
-        col_a, col_b, col_c, col_d, col_e = st.columns(5)
-        col_a.metric("Net Energy", f"{net_energy:+.1f} kWh")
-        col_b.metric("CO₂ Avoided", f"{daily_prod * EMISSION_FACTOR_KG_PER_KWH:,.0f} kg")
-        col_c.metric("Grid Saved", f"Rp{(daily_prod - daily_sell) * GRID_TARIFF_IDR_PER_KWH:,.0f}")
-        col_d.metric("Self-Cons.", f"{(daily_prod - daily_sell) / (daily_prod + 1e-6) * 100:.0f}%")
-        col_e.metric("Battery SOC", f"{soc:.0f}%")
+        # ----- Helper --------------------------------------------------
+        def rgba(hex_color: str, a: float = .35) -> str:
+            h = hex_color.lstrip("#")
+            r, g, b = int(h[:2], 16), int(h[2:4], 16), int(h[4:], 16)
+            return f"rgba({r},{g},{b},{a})"
 
-        self_cons_ratio = (daily_prod - daily_sell) / (daily_prod + 1e-6) * 100
-        self_suff_ratio = (daily_prod - daily_sell) / (daily_cons + 1e-6) * 100
-        st.progress(min(max(int(self_cons_ratio), 0), 100), text="Self-Consumption")
-        st.progress(min(max(int(self_suff_ratio), 0), 100), text="Self-Sufficiency")
+        # ----- Basic daily numbers ------------------------------------
+        d_prod = float(raw.get("DailyActiveProduction", {"value": 0})["value"])
+        d_cons = float(raw.get("DailyConsumption", {"value": 0})["value"])
+        d_buy  = float(raw.get("DailyEnergyBuy", {"value": 0})["value"])
 
-        since_7d = now - timedelta(days=7)
-        prod_7d = _get_historical(device_sn, "DailyActiveProduction", since_7d)
-        cons_7d = _get_historical(device_sn, "DailyConsumption", since_7d)
-        if not prod_7d.empty and not cons_7d.empty:
-            prod_daily = prod_7d.set_index("timestamp").resample("D").sum()
-            cons_daily = cons_7d.set_index("timestamp").resample("D").sum()
-            df_7d = pd.DataFrame({"Prod": prod_daily["value"], "Cons": cons_daily["value"]}).fillna(0)
-            df_7d["Net"] = df_7d["Prod"] - df_7d["Cons"]
-            df_7d["CO2"] = df_7d["Prod"] * EMISSION_FACTOR_KG_PER_KWH
-            df_7d["Cum_CO2"] = df_7d["CO2"].cumsum()
+        avoided_emis = d_prod * EMISSION_FACTOR_KG_PER_KWH
+        scope2_emis  = d_buy  * EMISSION_FACTOR_KG_PER_KWH
+        scope1_total = 0.0                 # isi real jika ada bahan bakar onsite
+        scope3_total = 0.0                 # isi real jika ada data rantai pasok
 
-            g1, g2, g3 = st.columns((1.6, 1.1, 1.3))
-            fig_bal = go.Figure()
-            fig_bal.add_trace(go.Scatter(x=df_7d.index, y=df_7d["Prod"], name="Prod", line=dict(width=0), stackgroup="one", fillcolor="rgba(0,204,0,.5)"))
-            fig_bal.add_trace(go.Scatter(x=df_7d.index, y=df_7d["Cons"], name="Cons", line=dict(width=0), stackgroup="one", fillcolor="rgba(30,144,255,.55)"))
-            fig_bal.update_layout(height=240, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.1, x=0.05))
-            g1.plotly_chart(fig_bal, use_container_width=True, key="balance")
+        # ----- REC & carbon value -------------------------------------
+        REC_PRICE_IDR_PER_MWh = 1_500_000
+        USD_IDR               = 16_000
+        carbon_price_usd      = 10
 
-            fig_net = px.bar(df_7d, x=df_7d.index, y="Net", color="Net", color_continuous_scale=[(0, "#ff4d4d"), (0.5, "#ffdd4d"), (1, COLOR_PV)])
-            fig_net.update_layout(height=240, template="plotly_dark", coloraxis_showscale=False, margin=dict(l=10, r=10, t=30, b=10))
-            g2.plotly_chart(fig_net, use_container_width=True, key="net_bar")
+        rec_generated = d_prod / 1000
+        rec_value     = rec_generated * REC_PRICE_IDR_PER_MWh
+        carbon_value_usd = avoided_emis/1000 * carbon_price_usd
+        carbon_value     = carbon_value_usd * USD_IDR
 
-            fig_cum = go.Figure(go.Scatter(x=df_7d.index, y=df_7d["Cum_CO2"], mode="lines+markers", line=dict(color=COLOR_BATTERY, width=2)))
-            fig_cum.update_layout(height=240, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10), yaxis_title="kg CO₂")
-            g3.plotly_chart(fig_cum, use_container_width=True, key="cum_co2")
+        total_rec      = rec_generated * 365
+        install_date   = "2024-01-01"
+        flows          = calculate_flows(raw)
+        pv_to_batt     = flows.get("PV→Battery", 0)
+        rec_buyers     = "C&I, Data Center, Mining"
+        net_zero_year  = 2030
+        remaining_emis = max(scope2_emis + scope3_total - avoided_emis, 0)
+        investment     = remaining_emis * 200_000
 
-            target_month = 1_500_000
-            saved_month = df_7d["Net"].clip(lower=0).sum() * GRID_TARIFF_IDR_PER_KWH
-            bullet = go.Figure(go.Indicator(mode="number+gauge", value=saved_month, number={"prefix": "Rp", "valueformat": ",.0f"},
-                                            gauge={"shape": "bullet", "axis": {"range": [0, target_month * 1.1]}, "bar": {"color": COLOR_PV},
-                                                   "threshold": {"line": {"color": COLOR_BATTERY, "width": 3}, "value": target_month}},
-                                            title={"text": "Month-to-date Cost Saving"}))
-            bullet.update_layout(height=180, template="plotly_dark", margin=dict(l=30, r=30, t=50, b=10))
-            st.plotly_chart(bullet, use_container_width=True, key="cost_bullet")
+        # ----- 3 dashboard columns ------------------------------------
+        dash1, dash2, dash3 = st.columns(3)
 
-        soc_24h = _get_historical(device_sn, "SOC", now - timedelta(hours=24))
-        if not soc_24h.empty:
-            st.plotly_chart(_plot_area(soc_24h, "%"), use_container_width=True, key="soc24h")
+        # === DASH 1 : Carbon ==========================================
+        with dash1:
+            st.markdown(f"""
+            <div class='glass-card' style="border-left:4px solid var(--pv);">
+            <h3>🌍 Real-Time Carbon Accounting</h3>
+            <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:1rem;">
+                <div class='kpi-card' style="background:rgba(255,255,255,0.05);">
+                <h4>Avoided Emissions</h4>
+                <p style="color:var(--pv);font-size:1.8rem;">{avoided_emis:,.0f} kg</p>
+                <small>≈ {avoided_emis/22:.0f} trees</small>
+                </div>
+                <div class='kpi-card' style="background:rgba(255,255,255,0.05);">
+                <h4>Carbon Debt</h4>
+                <p style="color:var(--load);font-size:1.8rem;">{scope2_emis:,.0f} kg</p>
+                <small>{d_buy:.1f} kWh grid import</small>
+                </div>
+            </div>
+            </div>""", unsafe_allow_html=True)
 
-        pie = px.pie(values=[daily_buy, daily_sell], names=["Buy", "Sell"], color_discrete_sequence=[COLOR_GRID, COLOR_PV], hole=0.45)
-        pie.update_traces(textposition="inside", texttemplate="%{label}: %{percent:.0%}")
-        pie.update_layout(height=280, template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
-        st.plotly_chart(pie, use_container_width=False, key="pie")
+            fig_sankey = go.Figure(go.Sankey(
+                node=dict(
+                    label=["Energy","PV Generation","Grid Import",
+                        "Scope 2","Avoided","Scope 3"],
+                    color=[COLOR_GRID, COLOR_PV, COLOR_GRID,
+                        COLOR_LOAD, COLOR_PV, COLOR_BATTERY]),
+                link=dict(
+                    source=[0,0,1,2,3,5],
+                    target=[1,2,3,3,4,3],
+                    value=[d_prod, d_buy, d_prod, d_buy, avoided_emis, scope3_total],
+                    color=[rgba(COLOR_PV), rgba(COLOR_GRID), rgba(COLOR_PV),
+                        rgba(COLOR_GRID), rgba(COLOR_PV), rgba(COLOR_BATTERY)]
+                )
+            ))
+            fig_sankey.update_layout(title="Carbon Flow Analysis",
+                                    height=400, template="plotly_dark")
+            st.plotly_chart(fig_sankey, use_container_width=True)
 
-        st.subheader("📋 Recommended Actions")
-        tips = []
-        if net_energy < 0:
-            tips.append(f"🔆 Upsize PV ±{abs(net_energy) / 4:.0f} kWp.")
-        if soc < 40:
-            tips.append("🔋 Charge battery midday (SOC < 40 %).")
-        if 'df_7d' in locals() and df_7d["Net"].min() < -5:
-            tips.append("⚡ Shift HVAC loads on deficit days.")
-        if self_suff_ratio < 70:
-            tips.append("🔋 Add battery to lift self-sufficiency > 70 %.")
-        tips.append("📜 Offer REC/carbon credits for formal Net-Zero Scope-2.")
-        for tip in tips:
-            st.markdown(f"- {tip}")
+        # === DASH 2 : REC =============================================
+        with dash2:
+            st.markdown(f"""
+            <div class='glass-card' style="border-left:4px solid var(--battery);">
+            <h3>📜 REC Management</h3>
+            <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:1rem;">
+                <div class='kpi-card' style="background:rgba(255,165,0,.05);">
+                <h4>REC Generated</h4>
+                <p style="color:var(--battery);font-size:1.8rem;">{rec_generated:.2f} MWh</p>
+                <small>1 REC = 1 MWh</small>
+                </div>
+                <div class='kpi-card' style="background:rgba(255,165,0,.05);">
+                <h4>REC Valuation</h4>
+                <p style="color:var(--battery);font-size:1.8rem;">Rp{rec_value:,.0f}</p>
+                <small>Market: Rp{REC_PRICE_IDR_PER_MWh:,.0f}/MWh</small>
+                </div>
+            </div>
+            <div class='glass-card' style="margin-top:1rem;background:rgba(0,0,0,.3);">
+                <h4>📅 Lifetime Achievement</h4>
+                <p style="font-size:2rem;text-align:center;margin:0;">
+                <span style="color:var(--pv);">{total_rec:.0f} MWh</span><br>
+                <small>Since {install_date}</small>
+                </p>
+            </div>
+            </div>""", unsafe_allow_html=True)
+
+        # === DASH 3 : Carbon Money ====================================
+        with dash3:
+            st.markdown(f"""
+            <div class='glass-card' style="border-left:4px solid var(--grid);">
+            <h3>💰 Carbon Economics</h3>
+            <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:1rem;">
+                <div class='kpi-card' style="background:rgba(30,144,255,.05);">
+                <h4>Carbon Credits</h4>
+                <p style="color:var(--grid);font-size:1.8rem;">{avoided_emis:,.0f} kg</p>
+                <small>Verified 0 kg</small>
+                </div>
+                <div class='kpi-card' style="background:rgba(30,144,255,.05);">
+                <h4>Monetization</h4>
+                <p style="color:var(--grid);font-size:1.8rem;">Rp{carbon_value:,.0f}</p>
+                <small>${carbon_value_usd:,.0f} @{USD_IDR:,.0f}</small>
+                </div>
+            </div>
+            <div class='glass-card' style="margin-top:1rem;background:linear-gradient(90deg,var(--pv),var(--grid));">
+                <h4 style="color:white;">📈 30-Year Projection</h4>
+                <p style="font-size:1.4rem;color:white;text-align:center;">
+                Rp{(carbon_value+rec_value)*365*30:,.0f}
+                </p>
+            </div>
+            </div>""", unsafe_allow_html=True)
+            
+        # ── Hitung variabel yang dipakai di Strategic Action Plan ──────────
+        soc = float(raw.get("SOC", {"value": 0})["value"])          # Battery SOC %
+        rec_generated = d_prod / 1000                               # MWh PV today
+        rec_value     = rec_generated * REC_PRICE_IDR_PER_MWh       # Rp
+
+        # Dapatkan aliran PV→Battery dari fungsi calculate_flows()
+        flows = calculate_flows(raw)
+        pv_to_batt = flows.get("PV→Battery", 0)
+        
+        # --- Strategic Action Plan ---------------------------------------
+        st.markdown(
+            """
+            <div class='glass-card' style="background:linear-gradient(45deg,rgba(0,204,0,.1),rgba(30,144,255,.1));">
+            <h2 style="color: var(--pv); border-bottom: 2px solid; padding-bottom: .5rem;">🚀 Strategic Action Plan</h2>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        strategy_cols = st.columns(3)
+
+        # -- Column 1 : Battery Opt ---------------------------------------
+        strategy_cols[0].markdown(
+            f"""
+            <div class='glass-card' style="border-left:4px solid var(--pv);">
+            <h4>🔋 Battery Optimization</h4>
+            <ul style="padding-left:1rem;">
+                <li>Target SOC : 80 % (Now {soc:.0f} %)</li>
+                <li>Potential Savings : Rp{rec_value*0.3:,.0f} / hari</li>
+                <li>🔌 Charge from PV : {pv_to_batt:.2f} kW</li>
+            </ul>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # -- Column 2 : REC Strategy --------------------------------------
+        strategy_cols[1].markdown(
+            f"""
+            <div class='glass-card' style="border-left:4px solid var(--grid);">
+            <h4>📜 REC Strategy</h4>
+            <ul style="padding-left:1rem;">
+                <li>Certification : I-REC Standard</li>
+                <li>Potential Buyers : {rec_buyers}</li>
+                <li>📅 Expiry : 3 tahun</li>
+            </ul>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # -- Column 3 : Net-Zero Roadmap -----------------------------------
+        strategy_cols[2].markdown(
+            f"""
+            <div class='glass-card' style="border-left:4px solid var(--battery);">
+            <h4>🌍 Net-Zero Roadmap</h4>
+            <ul style="padding-left:1rem;">
+                <li>Target Year : {net_zero_year}</li>
+                <li>Required Offset : {remaining_emis:,.0f} ton/tahun</li>
+                <li>💡 Investasi : Rp{investment:,.0f}</li>
+            </ul>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # --- Live Carbon Market (static mock) -----------------------------
+        st.markdown(
+            """
+            <div class='glass-card' style="background:rgba(0,0,0,.4);">
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;text-align:center;">
+                <div>
+                <h4>EU Carbon</h4>
+                <p style="color: var(--pv);">€85.40</p>
+                <small>+1.2 % today</small>
+                </div>
+                <div>
+                <h4>California</h4>
+                <p style="color: var(--pv);">$30.15</p>
+                <small>Vol 1.2 M t</small>
+                </div>
+                <div>
+                <h4>I-REC</h4>
+                <p style="color: var(--pv);">$2.80/MWh</p>
+                <small>±0 % month</small>
+                </div>
+                <div>
+                <h4>IDX Karbon</h4>
+                <p style="color: var(--pv);">Rp35 000</p>
+                <small>Jakarta Carbon</small>
+                </div>
+            </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        
 
 if __name__ == "__main__":
     main()
